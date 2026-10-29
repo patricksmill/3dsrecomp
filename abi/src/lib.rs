@@ -445,6 +445,20 @@ impl Library {
     }
 
     /// the module called name.
+    /// marks the function of unit that starts at start stale, as if its code
+    /// had changed, so that the interpreter runs it, for a host that has to
+    /// see it run instruction by instruction. whether there is one.
+    pub fn interpret(&mut self, unit: usize, start: u32) -> bool {
+        let Some(origins) = self.origins(unit) else { return false };
+        let Some(index) = origins.functions().iter().position(|function| function.start == start) else { return false };
+        // SAFETY: as in check, a flag and a start per function
+        unsafe {
+            *origins.stale.add(index) = 1;
+            *origins.starts.add(index) = NO_START;
+        }
+        true
+    }
+
     pub fn module_index(&self, name: &str) -> Option<usize> {
         self.modules().iter().position(|module| module.name() == name)
     }
