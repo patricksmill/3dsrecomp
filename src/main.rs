@@ -159,7 +159,7 @@ fn print_event(event: Event) {
 
 /// a Cargo project at dir that builds the title into a program of its own.
 fn port(path: &str, dir: &Path, options: &Options) {
-    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), Mods::default(), &print_event)
+    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), &[], Mods::default(), &print_event)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             exit(1);

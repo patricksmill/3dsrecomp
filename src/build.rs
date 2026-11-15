@@ -32,6 +32,9 @@ pub struct Options<'a> {
     pub dir: Option<&'a Path>,
     /// C files of functions written by hand, see docs/overrides.md.
     pub overrides: Option<&'a Path>,
+    /// overrides a host carries, each set for one revision of a title's
+    /// code and left out of a library of any other.
+    pub pinned: &'a [overrides::Pinned<'a>],
     /// set from elsewhere to stop it.
     pub cancel: Option<&'a AtomicBool>,
     /// the code and modules a mod changes, recompiled in place of the
@@ -58,17 +61,29 @@ pub fn generate(
     rom: &Path,
     pick: impl FnOnce(&Title) -> PathBuf,
     overrides: Option<&Path>,
+    pinned: &[overrides::Pinned],
     mods: Mods,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<Generated, String> {
     let title = Title::load(rom).map_err(|error| format!("could not load {}, {error}", rom.display()))?;
     let mut programs = crate::programs(&title, mods).map_err(|error| format!("could not read the code, {error}"))?;
     let dir = pick(&title);
-    let files = match overrides {
+    let mut files = match overrides {
         Some(path) => overrides::load(path)?,
         None => Vec::new(),
     };
+    files.extend(pinned_files(title.program_id(), &programs, pinned, events)?);
     let replaced: Vec<Override> = files.iter().flat_map(|file| file.overrides.iter().cloned()).collect();
+    for (i, file) in files.iter().enumerate() {
+        if files[..i].iter().any(|earlier| earlier.path.file_name() == file.path.file_name()) {
+            return Err(format!("two override files are called {}", file.path.display()));
+        }
+    }
+    for (i, item) in replaced.iter().enumerate() {
+        if replaced[..i].iter().any(|earlier| earlier.module == item.module && earlier.address == item.address) {
+            return Err(format!("0x{:08X} is overridden twice", item.address));
+        }
+    }
     // whatever an override replaces has to be generated too, for it to call
     for item in &replaced {
         let name = item.module.as_deref().unwrap_or("executable");
@@ -124,13 +139,40 @@ pub fn generate(
     Ok(Generated { title, dir, sources })
 }
 
+/// the files of the pinned sets for the title's executable as it is, by its
+/// code's hash. a set for another revision of it is left out, and said so.
+fn pinned_files(
+    program_id: u64,
+    programs: &[(String, Program)],
+    pinned: &[overrides::Pinned],
+    events: &(dyn Fn(Event) + Sync),
+) -> Result<Vec<overrides::File>, String> {
+    let ours: Vec<&overrides::Pinned> = pinned.iter().filter(|set| set.program_id == program_id).collect();
+    let executable = programs.iter().find(|(name, _)| name == "executable").map(|(_, program)| program);
+    let (Some(executable), false) = (executable, ours.is_empty()) else { return Ok(Vec::new()) };
+    let hash = code_hash(executable);
+    let mut files = Vec::new();
+    for set in ours {
+        if set.code_hash != hash {
+            events(Event::Note(format!(
+                "the {} overrides kept for code {:016X} stay out, this code is {hash:016X}",
+                set.files.len(),
+                set.code_hash
+            )));
+            continue;
+        }
+        files.extend(set.load()?);
+    }
+    Ok(files)
+}
+
 /// recompiles the title at rom into a library and returns where it ended
 /// up, installed when the options name no dir.
 pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> Result<PathBuf, String> {
     let compiler = compile::check(options.compiler.as_ref())?;
     let stopped = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
     let pick = |title: &Title| options.dir.map(Path::to_owned).unwrap_or_else(|| cache_dir(title.program_id()));
-    let generated = generate(rom, pick, options.overrides, options.mods, events)?;
+    let generated = generate(rom, pick, options.overrides, options.pinned, options.mods, events)?;
     if stopped() {
         return Err("stopped".to_owned());
     }
@@ -333,7 +375,7 @@ mod tests {
         let (code, module) = (bytes(&modded), named("Battle", &modded));
         let romfs = |path: &str| (path == "cro/Battle.cro").then(|| module.clone());
         let tables = |mods: Mods| {
-            generate(&path, |_| dir.clone(), None, mods, &|_| {}).unwrap();
+            generate(&path, |_| dir.clone(), None, &[], mods, &|_| {}).unwrap();
             std::fs::read_to_string(dir.join("entries.c")).unwrap()
         };
 
@@ -346,6 +388,51 @@ mod tests {
         assert!(plain.contains(&piece(0x200, 0x208, &bytes(&own))), "{plain}");
 
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// a pinned set goes into the library of the code it was checked
+    /// against, and only that one's: another revision's gets a note.
+    #[test]
+    fn pinned_overrides_go_only_with_their_code() {
+        let own = [0xE3A0_0000, 0xE12F_FF1E];
+        let path = rom("generate-pinned", &bytes(&own), &[]);
+        let dir = std::env::temp_dir().join(format!("3dsrecomp-generate-pinned-{}", std::process::id()));
+        let title = Title::load(&path).unwrap();
+        let programs = crate::programs(&title, Mods::default()).unwrap();
+        let hash = code_hash(&programs.iter().find(|(name, _)| name == "executable").unwrap().1);
+        let source = "#include \"overrides.h\"\nRECOMP_OVERRIDE(0x00100000) { RETURN_TO(ctx->r[14]); }\n";
+        let files = [("kept.c", source)];
+        let set = |code_hash| overrides::Pinned { program_id: title.program_id(), code_hash, files: &files };
+        let notes = std::sync::Mutex::new(Vec::new());
+        let events = |event: Event| {
+            if let Event::Note(note) = event {
+                notes.lock().unwrap().push(note);
+            }
+        };
+        let run = |pinned: &[overrides::Pinned]| {
+            let _ = std::fs::remove_dir_all(&dir);
+            generate(&path, |_| dir.clone(), None, pinned, Mods::default(), &events).map(|generated| generated.sources)
+        };
+
+        let sources = run(&[set(hash)]).unwrap();
+        assert!(sources.contains(&"hand/kept.c".to_owned()), "{sources:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("hand/kept.c")).unwrap(), source);
+
+        let sources = run(&[set(hash ^ 1)]).unwrap();
+        assert!(!sources.iter().any(|name| name.starts_with("hand/")), "{sources:?}");
+        assert!(notes.lock().unwrap().iter().any(|note| note.contains("stay out")), "{:?}", notes.lock().unwrap());
+
+        let other = overrides::Pinned { program_id: title.program_id() ^ 1, ..set(hash) };
+        assert!(!run(&[other]).unwrap().iter().any(|name| name.starts_with("hand/")));
+
+        let twice = run(&[set(hash), set(hash)]).err().unwrap();
+        assert!(twice.contains("two override files"), "{twice}");
+        let again = [("again.c", source)];
+        let twice = run(&[set(hash), overrides::Pinned { files: &again, ..set(hash) }]).err().unwrap();
+        assert!(twice.contains("overridden twice"), "{twice}");
+
+        let _ = std::fs::remove_dir_all(dir);
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -45,6 +45,31 @@ pub fn load(path: &Path) -> Result<Vec<File>, String> {
         .collect()
 }
 
+/// C files of overrides a host carries for one revision of one title's
+/// code, checked against that code by its hash, see build::code_hash, so
+/// they never go into a library of an update or a mod that changes it.
+#[derive(Debug, Clone, Copy)]
+pub struct Pinned<'a> {
+    pub program_id: u64,
+    /// the hash of the executable's code they were checked against.
+    pub code_hash: u64,
+    /// the files, by name, with their sources.
+    pub files: &'a [(&'a str, &'a str)],
+}
+
+impl Pinned<'_> {
+    /// the files, their overrides read, as named.
+    pub fn load(&self) -> Result<Vec<File>, String> {
+        self.files
+            .iter()
+            .map(|(name, source)| {
+                let overrides = parse(source).map_err(|e| format!("{name}, {e}"))?;
+                Ok(File { path: PathBuf::from(name), source: (*source).to_owned(), overrides })
+            })
+            .collect()
+    }
+}
+
 /// the overrides a C source marks.
 pub fn parse(source: &str) -> Result<Vec<Override>, String> {
     let code = strip_comments(source);
