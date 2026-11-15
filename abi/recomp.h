@@ -713,6 +713,22 @@ static inline void recomp_call(Context *ctx) {
 
 #define OUT_OF_BUDGET() OUT_OF_BUDGET_AT(out_of_budget)
 
+/* charges count instructions for code written by hand that runs to its end
+   once entered. it only leaves for the host on the way in, before it has
+   done anything, so the host comes back to address, its start; past that
+   the budget can go below zero, and the thread overruns its slice by what
+   is left. */
+#define BUDGET_ATOMIC(address, count) \
+    do { \
+        if (UNLIKELY(BUDGET_LEFT <= 0)) { \
+            SYNC_OUT(); \
+            ctx->r[15] = (address); \
+            ctx->exit = EXIT_BUDGET; \
+            return; \
+        } \
+        BUDGET_LEFT -= (int32_t)(count); \
+    } while (0)
+
 #define SVC(next, number) do { \
     SYNC_OUT(); \
     ctx->r[15] = (next); \

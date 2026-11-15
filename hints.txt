@@ -5,6 +5,11 @@
 # then an address a line, odd for Thumb.
 # 3dsrecomp hints <rom> [<hints file>] prints a game's section.
 
+# Kid Icarus: Uprising USA; observed ARM execution enters an undiscovered
+# continuation of the boot routine at 00C511F8.
+= 0004000000030100 D6E028C6175A2B07
+00C511F8
+
 = 0004000000033500 FB2726AC60F896F4
 002C098C
 
