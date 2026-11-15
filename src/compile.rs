@@ -283,19 +283,31 @@ pub fn shared(compiler: &Compiler, objects: &[PathBuf], library: &Path) -> Resul
     finished(command.arg("-shared").arg("-o").arg(library).args(objects).status(), "linking")
 }
 
-/// has command run in the folder objects are all in and gives their names
-/// from there, their whole paths when they are not in one. a command line
-/// on Windows holds 32767 characters, which the whole paths of the 600
-/// objects of Monster Hunter 3 Ultimate or Pokémon Sun pass.
+/// has command run in the folder objects are all in, or under, and gives
+/// their paths from there, hand/scalar.o for an override's, their whole
+/// paths when they share no folder. a command line on Windows holds 32767
+/// characters, which the whole paths of the 600 objects of Monster Hunter 3
+/// Ultimate or Pokémon Sun pass, and the 529 of Kid Icarus with overrides.
 fn from_folder(command: &mut Command, objects: &[PathBuf]) -> Vec<PathBuf> {
-    let folder = objects.first().and_then(|object| object.parent()).filter(|folder| !folder.as_os_str().is_empty());
-    match folder.filter(|folder| objects.iter().all(|object| object.parent() == Some(*folder))) {
-        Some(folder) => {
+    match common_folder(objects) {
+        Some((folder, relative)) => {
             command.current_dir(folder);
-            objects.iter().map(|object| object.file_name().map_or_else(|| object.clone(), PathBuf::from)).collect()
+            relative
         }
         None => objects.to_vec(),
     }
+}
+
+/// the folder nearest the root of those the objects are in, when every one
+/// is in it or under it, with their paths from it.
+fn common_folder(objects: &[PathBuf]) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let folder = objects
+        .iter()
+        .filter_map(|object| object.parent())
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .min_by_key(|folder| folder.components().count())?;
+    let relative = objects.iter().map(|object| object.strip_prefix(folder).ok().map(Path::to_owned)).collect::<Option<Vec<_>>>()?;
+    Some((folder.to_owned(), relative))
 }
 
 /// what a tool's run came to, an error saying why when it failed.
@@ -327,6 +339,23 @@ pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the objects of overrides, in hand below the generated ones, are
+    /// given from the generated ones' folder too, keeping the line short.
+    #[test]
+    fn objects_are_given_from_the_folder_they_are_all_under() {
+        let dir = Path::new("cache").join("0004000000030100");
+        let objects = [dir.join("code000.o"), dir.join("hand").join("scalar.o"), dir.join("entries.o")];
+        let (folder, relative) = common_folder(&objects).unwrap();
+        assert_eq!(folder, dir);
+        assert_eq!(relative, [PathBuf::from("code000.o"), Path::new("hand").join("scalar.o"), PathBuf::from("entries.o")]);
+        // all under hand, hand is the folder
+        let hand = [dir.join("hand").join("a.o"), dir.join("hand").join("b.o")];
+        assert_eq!(common_folder(&hand).unwrap().0, dir.join("hand"));
+        // none in common, whole paths
+        assert!(common_folder(&[Path::new("one").join("a.o"), Path::new("two").join("b.o")]).is_none());
+        assert!(common_folder(&[PathBuf::from("a.o")]).is_none());
+    }
 
     #[test]
     fn cc_names_a_program_and_what_goes_before_the_rest() {
