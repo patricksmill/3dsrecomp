@@ -1,6 +1,5 @@
-//! checking recompiled code against the interpreter. both run a function
-//! from the same made up state over their own copy of the title's memory,
-//! and anything that differs afterwards is a bug in one of them.
+//! checks recompiled code vs the interpreter
+//! both run a func from the same made up state on their own copy of the title's memory, any difference after is a bug in one of them
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -10,19 +9,19 @@ use zakuro_cpu::{Bus, Cpu, Exit};
 use crate::abi::{self, Code, Context, Host, Library};
 
 const PAGE_SIZE: usize = 0x1000;
-/// the return address functions are called with, which nothing maps.
+/// return addr funcs get called with, nothing maps it
 const RETURN: u32 = 0xFFFF_FFF0;
 const STACK_TOP: u32 = 0x1000_0000;
 const STACK_SIZE: u32 = 0x4_0000;
 const HEAP: u32 = 0x0800_0000;
 const HEAP_SIZE: u32 = 0x4_0000;
 const TLS: u32 = 0x1FF8_2000;
-/// instructions a run may take before it counts as stuck.
+/// instrs a run may take b4 it counts as stuck
 const LIMIT: i32 = 200_000;
 
-/// where the harness loads the module it checks.
+/// where the harness loads the module it checks
 pub const MODULE_BASE: u32 = 0x0A00_0000;
-/// what a module's imports lead to, a function returning zero.
+/// what a module's imports lead to, a func returning 0
 pub const IMPORT_STUB: u32 = 0x0B00_0000;
 
 #[derive(Clone)]
@@ -74,9 +73,7 @@ impl Memory {
         self.faults = 0;
     }
 
-    /// the first address whose byte differs between two copies.
-    /// the first address whose byte differs between two copies, where two
-    /// NaNs count as the same whatever their bits.
+    /// first addr whose byte differs between two copies, two NaNs count as equal whatever their bits
     fn first_difference(&self, other: &Memory) -> Option<u32> {
         self.regions.iter().zip(&other.regions).filter(|(region, _)| region.writable).find_map(|(a, b)| {
             let mut i = 0;
@@ -100,7 +97,7 @@ impl Memory {
     }
 }
 
-/// whether the float of size bytes at offset is a NaN in both a and b.
+/// is the float of size bytes at offset a NaN in both a and b
 fn nans(a: &[u8], b: &[u8], offset: usize, size: usize) -> bool {
     let nan = |bytes: &[u8]| match *bytes.get(offset..offset + size).unwrap_or_default() {
         [_, _, _, _] => f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()).is_nan(),
@@ -110,9 +107,8 @@ fn nans(a: &[u8], b: &[u8], offset: usize, size: usize) -> bool {
     nan(a) && nan(b)
 }
 
-/// whether two sets of VFP registers hold the same values, where two NaNs
-/// count as the same. the compilers on each side are free to pick which NaN
-/// comes out of an operation, and so is the hardware.
+/// do two sets of VFP regs hold the same values, NaNs count as equal
+/// compilers on both sides pick whatever NaN they like and so does the hw
 fn same_vfp(a: &[u32; 32], b: &[u32; 32]) -> bool {
     let single = |bits: u32| f32::from_bits(bits).is_nan();
     let double = |r: &[u32; 32], d: usize| f64::from_bits((r[2 * d + 1] as u64) << 32 | r[2 * d] as u64).is_nan();
@@ -128,7 +124,7 @@ impl Bus for Memory {
             self.faults += 1;
             return 0;
         }
-        // SAFETY: a mapped page is PAGE_SIZE bytes of a region's buffer
+        // safe bc a mapped page is PAGE_SIZE bytes of a region's buffer
         unsafe { *page.add((address & 0xFFF) as usize) }
     }
 
@@ -146,7 +142,7 @@ impl Bus for Memory {
             self.faults += 1;
             return;
         }
-        // SAFETY: as in read8
+        // safe, same as read8
         unsafe { *page.add((address & 0xFFF) as usize) = value }
     }
 
@@ -163,17 +159,20 @@ impl Bus for Memory {
     }
 }
 
-/// one side of a comparison.
+/// one side of a comparison
 struct Run {
     memory: Memory,
     cpu: Cpu,
     library: *const Library,
-    /// what the interpreter stopped with inside a callback.
+    /// what the interpreter stopped with inside a callback
     pending: Option<Exit>,
-    /// instructions the interpreter ran on the recompiled side, alone or
-    /// for the code.
+    /// instrs the interpreter ran on the recompiled side, alone or for the code
     interpreted: u64,
     fallbacks: u64,
+    /// do svcs change nothing so the run goes on after them (like a host running them in place) instead of ending
+    through: bool,
+    /// svcs it went on through
+    svcs: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -191,12 +190,18 @@ fn stop(exit: Exit) -> Stop {
     }
 }
 
-/// the run a callback belongs to.
+/// does a run go on after what the interpreter stopped with, an svc it goes thru, counting it
+fn goes_through(run: &mut Run, exit: &Exit) -> bool {
+    let through = run.through && matches!(exit, Exit::Supervisor(_));
+    run.svcs += through as u64;
+    through
+}
+
+/// the run a callback belongs to
 ///
 /// # Safety
 ///
-/// ctx must be a context set up by recompiled, whose user field points at
-/// a live Run nothing else is using.
+/// ctx must be a context set up by recompiled, its user field pointing at a live Run nobody else uses
 unsafe fn run_of<'a>(ctx: *mut Context) -> &'a mut Run {
     unsafe { &mut *((*ctx).user as *mut Run) }
 }
@@ -246,7 +251,20 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { (*run_of(ctx).library).lookup(address) }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
+/// an svc, the code goes on after it when the run goes thru them, else it ends the run like the interpreter's
+unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
+    unsafe {
+        let run = run_of(ctx);
+        if run.through {
+            run.svcs += 1;
+        } else {
+            (*ctx).svc = number;
+            (*ctx).exit = abi::EXIT_SVC;
+        }
+    }
+}
+
+static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
 
 fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;
@@ -280,23 +298,22 @@ fn interpreted(run: &mut Run) -> Stop {
             return Stop::Returned;
         }
         if let Some(exit) = run.cpu.step(&mut run.memory) {
-            return stop(exit);
+            if !goes_through(run, &exit) {
+                return stop(exit);
+            }
         }
     }
     Stop::Limit
 }
 
-/// runs the recompiled code the way a host would, falling back to the
-/// interpreter wherever there is none. slice is the budget each run of the
-/// code gets, out of LIMIT in all. a short one makes the code stop at block
-/// starts and go on from there, which is what a host does at the end of a
-/// timeslice, and when a block does not fit, one instruction goes through
-/// the interpreter instead, as in Zakuro. budget holds what is left after.
+/// runs the recompiled code like a host would, falling back to the interpreter where there's none
+/// slice is the budget per run of the code, out of LIMIT total
+/// a short one stops the code at block starts and goes on from there, like a host at the end of a timeslice
+/// when a block doesn't fit one instr goes thru the interpreter instead, like in zakuro, budget holds what's left
 ///
 /// # Safety
 ///
-/// run and ctx have to stay valid and unaliased for the whole run, the
-/// callbacks reach run through ctx.
+/// run and ctx must stay valid and unaliased the whole run, callbacks reach run thru ctx
 unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
     unsafe {
         let mut left = LIMIT;
@@ -312,6 +329,7 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
                 (*ctx).budget = budget;
                 (*ctx).exit = abi::EXIT_NONE;
                 (*ctx).depth = 0;
+                (*ctx).stack_limit = abi::stack_limit();
                 code(ctx);
                 let spent = budget - (*ctx).budget;
                 left -= spent;
@@ -320,7 +338,7 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
                 }
                 match (*ctx).exit {
                     abi::EXIT_SVC => break Stop::Svc((*ctx).svc),
-                    // the block did not fit, the interpreter takes a step
+                    // the block didn't fit, the interpreter takes a step
                     abi::EXIT_BUDGET if spent == 0 => {}
                     _ => continue,
                 }
@@ -333,7 +351,9 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
             left -= 1;
             run.interpreted += 1;
             if let Some(exit) = exit {
-                break stop(exit);
+                if !goes_through(run, &exit) {
+                    break stop(exit);
+                }
             }
         };
         (*ctx).budget = left;
@@ -341,7 +361,7 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
     }
 }
 
-/// xorshift, enough to make up states.
+/// xorshift, good enough to make up states
 struct Random(u64);
 
 impl Random {
@@ -361,7 +381,7 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
     let mut found = Vec::new();
     let nan = |bits: u32| f32::from_bits(bits).is_nan();
     for i in 0..16 {
-        // a NaN moved out of a VFP register
+        // a NaN moved out of a VFP reg
         if a.cpu.regs[i] != ctx.r[i] && !(nan(a.cpu.regs[i]) && nan(ctx.r[i])) {
             found.push(format!("r{i} {:08X} against {:08X}", a.cpu.regs[i], ctx.r[i]));
         }
@@ -398,8 +418,7 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
     found
 }
 
-/// the title's memory, its segments where it expects them plus a stack, a
-/// heap and thread local storage full of made up data.
+/// the title's memory, its segments where it expects them plus a stack, heap and TLS full of made up junk
 pub fn regions(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss: u32) -> Vec<Region> {
     let mut random = Random(0x9E37_79B9_7F4A_7C15);
     let mut heap = vec![0u8; HEAP_SIZE as usize];
@@ -423,14 +442,15 @@ pub fn regions(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss
 
 #[derive(Default)]
 pub struct Report {
-    /// instructions run as recompiled code, through the fallback and in
-    /// the interpreter alone.
+    /// instrs run as recompiled code, thru the fallback, and in the interpreter alone
     pub native: u64,
     pub fallbacks: u64,
     pub interpreted: u64,
     pub tested: usize,
     pub returned: usize,
     pub svc: usize,
+    /// svcs runs went thru and still matched
+    pub through: u64,
     pub stuck: usize,
     pub other: usize,
     pub mismatched: usize,
@@ -444,17 +464,66 @@ impl Report {
         self.tested += other.tested;
         self.returned += other.returned;
         self.svc += other.svc;
+        self.through += other.through;
         self.stuck += other.stuck;
         self.other += other.other;
         self.mismatched += other.mismatched;
     }
 }
 
-/// runs each function both ways, printing the first few mismatches. the
-/// functions are entries with bit 0 set for Thumb.
+/// the context run's recompiled side works on, regs left for store to fill in, run must stay put while the code runs
+fn context(run: &mut Run) -> Context {
+    Context {
+        r: [0; 16],
+        n: 0,
+        z: 0,
+        c: 0,
+        v: 0,
+        q: 0,
+        thumb: 0,
+        ge: 0,
+        exclusive: 0,
+        budget: 0,
+        exit: 0,
+        svc: 0,
+        depth: 0,
+        exclusive_address: 0,
+        tls: 0,
+        read_pages: run.memory.read_pages.as_ptr(),
+        write_pages: run.memory.write_pages.as_ptr(),
+        vfp: run.cpu.vfp.regs.as_mut_ptr(),
+        fpscr: &mut run.cpu.vfp.fpscr,
+        host: &HOST,
+        user: run as *mut Run as *mut c_void,
+        stack_limit: 0,
+        tick_end: 0,
+        tick_last: 0,
+        tick_floor: i32::MAX,
+        tick_cost: 0,
+        tick_at: abi::NO_TICKS,
+        ticks: 0,
+        wait_at: abi::NO_TICKS,
+        release_at: abi::NO_TICKS,
+        held: 0,
+        holding: 0,
+        held_floor: abi::NOTHING_HELD,
+        done: 0,
+        trail: [0; abi::TRAIL],
+    }
+}
+
+/// runs each func both ways and prints the first few mismatches, funcs are entries w/ bit 0 for Thumb
 pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
-    let fresh =
-        || Run { memory: pristine.duplicate(), cpu: Cpu::new(), library, pending: None, interpreted: 0, fallbacks: 0 };
+    let fresh = || Run {
+        memory: pristine.duplicate(),
+        cpu: Cpu::new(),
+        library,
+        pending: None,
+        interpreted: 0,
+        fallbacks: 0,
+        through: false,
+        svcs: 0,
+    };
     let mut a = fresh();
     let mut b = fresh();
     let mut report = Report::default();
@@ -483,8 +552,7 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         for register in 0..32 {
             cpu.vfp.regs[register] = ((random.next() % 20_000) as f32 / 100.0 - 100.0).to_bits();
         }
-        // half the runs start on short vectors of some length and stride,
-        // with flush to zero on or off
+        // half the runs start on short vectors of some length and stride, flush to zero on or off
         if random.next().is_multiple_of(2) {
             let stride = if random.next().is_multiple_of(2) { 3 << 20 } else { 0 };
             let flush = if random.next().is_multiple_of(2) { 1 << 24 } else { 0 };
@@ -494,39 +562,23 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         a.cpu = cpu.clone();
         b.cpu = cpu.clone();
 
-        let mut ctx = Context {
-            r: [0; 16],
-            n: 0,
-            z: 0,
-            c: 0,
-            v: 0,
-            q: 0,
-            thumb: 0,
-            ge: 0,
-            exclusive: 0,
-            budget: 0,
-            exit: 0,
-            svc: 0,
-            depth: 0,
-            exclusive_address: 0,
-            tls: 0,
-            read_pages: b.memory.read_pages.as_ptr(),
-            write_pages: b.memory.write_pages.as_ptr(),
-            vfp: b.cpu.vfp.regs.as_mut_ptr(),
-            fpscr: &mut b.cpu.vfp.fpscr,
-            host: &HOST,
-            user: &mut b as *mut Run as *mut c_void,
-        };
+        let mut ctx = context(&mut b);
         store(&cpu, &mut ctx);
 
+        // half the funcs go thru their svcs, the other half end at the first one (like all v4 code, no svc callback there)
+        // the coin is a product's top bit, which says nothing about xorshift's coin for the slices below (a sum of the addr's bits)
+        let through = library.abi() > 4 && (function as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 63 == 1;
+        for run in [&mut a, &mut b] {
+            run.through = through;
+            run.svcs = 0;
+        }
         let expected = interpreted(&mut a);
         b.interpreted = 0;
         b.fallbacks = 0;
-        // half the functions run in short slices, stopping for the budget at
-        // block starts and going on from there
+        // half the funcs run in short slices, stopping for the budget at block starts and going on from there
         let mut slicing = Random(0x2545_F491_4F6C_DD1D ^ function as u64);
         let slice = if slicing.next().is_multiple_of(2) { LIMIT } else { 1 + (slicing.next() % 48) as i32 };
-        // SAFETY: b and ctx live through the run and nothing else touches them
+        // safe bc b and ctx live thru the run and nothing else touches them
         let got = unsafe { recompiled(&mut b, &mut ctx, slice) };
         report.tested += 1;
         let spent = (LIMIT - ctx.budget) as u64;
@@ -534,7 +586,7 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         report.fallbacks += b.fallbacks;
         report.interpreted += b.interpreted;
         if functions.len() == 1 {
-            // a single function gets the whole story
+            // a single func gets the whole story
             println!("  {name} {function:08X}, interpreter stopped with {expected:?}, recompiled with {got:?}");
             println!(
                 "  recompiled side, {} native, {} fallbacks, {} interpreted alone",
@@ -557,6 +609,9 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             continue;
         }
         let mut found = differences(&a, &b, &ctx);
+        if a.svcs != b.svcs {
+            found.insert(0, format!("went through {} svcs against {}", a.svcs, b.svcs));
+        }
         if expected != got {
             found.insert(0, format!("stopped with {expected:?} against {got:?}"));
         }
@@ -567,11 +622,185 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             }
             continue;
         }
+        report.through += a.svcs;
         match expected {
             Stop::Returned => report.returned += 1,
             Stop::Svc(_) => report.svc += 1,
             _ => report.other += 1,
         }
     }
+    report
+}
+
+/// a division's case, quotient bits, was a sign set, did n and d have high words
+type Case = (u32, bool, bool, bool);
+
+/// what the title's code charged in a case, least, most, sum and how many times
+type Charged = (u64, u64, u64, i32);
+
+/// how the natives did vs the title's own code for them
+#[derive(Default)]
+pub struct NativesReport {
+    pub tested: usize,
+    pub mismatched: usize,
+    /// divisions the natives charged like the title's code, out of how many, and the worst miss
+    pub charged_alike: usize,
+    pub charged: usize,
+    pub most_off: i32,
+}
+
+/// numbers to divide (n, d) of every size up to bits, both signs when signed, so the lib's code takes every path
+/// plus the edges, divide by 0 and 1, and the quotient that overflows
+fn dividends(random: &mut Random, bits: u32, signed: bool) -> Vec<(u64, u64)> {
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mut sized = |size: u32| {
+        let value = (random.next() as u64) << 32 | random.next() as u64;
+        if size == 0 { 0 } else { (value | 1 << (size - 1)) & (u64::MAX >> (64 - size)) }
+    };
+    let mut cases = Vec::new();
+    for n_bits in 0..=bits {
+        for d_bits in 1..=bits {
+            cases.push((sized(n_bits), sized(d_bits)));
+        }
+    }
+    let top = 1u64 << (bits - 1);
+    cases.extend([(12345, 0), (0, 7), (7, 1), (top, mask), (mask, 1), (mask, mask), (top, 3)]);
+    if signed {
+        let flipped: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n.wrapping_neg() & mask, d)).collect();
+        let both: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n.wrapping_neg() & mask, d.wrapping_neg() & mask)).collect();
+        let divisor: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n, d.wrapping_neg() & mask)).collect();
+        cases.extend(flipped);
+        cases.extend(both);
+        cases.extend(divisor);
+    }
+    cases
+}
+
+/// runs each native the lib has and the title's own code for it in the interpreter, on the dividends numbers
+/// quotient, remainder and every reg a call keeps must agree
+/// also runs the title's code recompiled w/ natives off and prints what it charges vs the natives, by quotient bits
+pub fn natives(pristine: &Memory, library: &mut Library, natives: &[crate::natives::Native]) -> NativesReport {
+    use crate::natives::Kind;
+    use std::collections::BTreeMap;
+    let library: *mut Library = library;
+    let fresh = || Run {
+        memory: pristine.duplicate(),
+        cpu: Cpu::new(),
+        library,
+        pending: None,
+        interpreted: 0,
+        fallbacks: 0,
+        through: false,
+        svcs: 0,
+    };
+    let mut report = NativesReport::default();
+    // divisions only touch the stack, so runs go on from where the last one left memory
+    let mut expected = fresh();
+    let mut got = fresh();
+    for native in natives {
+        let (bits, signed, results) = match native.kind {
+            Kind::Uidivmod => (32, false, 2),
+            Kind::Idivmod => (32, true, 2),
+            Kind::Uldivmod => (64, false, 4),
+            Kind::Ldivmod => (64, true, 4),
+        };
+        let mut random = Random(0x5DEE_CE66_D000_0000 ^ native.address as u64);
+        // what each side charged, by quotient bits and whether a sign or a high word was in it
+        let mut charges: BTreeMap<Case, Charged> = BTreeMap::new();
+        for (n, d) in dividends(&mut random, bits, signed) {
+            let mut cpu = Cpu::new();
+            for register in 4..13 {
+                cpu.regs[register] = random.next();
+            }
+            let (n_low, n_high, d_low, d_high) = (n as u32, (n >> 32) as u32, d as u32, (d >> 32) as u32);
+            if bits == 32 {
+                cpu.regs[0] = n_low;
+                cpu.regs[1] = d_low;
+            } else {
+                cpu.regs[..4].copy_from_slice(&[n_low, n_high, d_low, d_high]);
+            }
+            cpu.regs[13] = STACK_TOP - 0x1000;
+            cpu.regs[14] = RETURN;
+            cpu.regs[15] = native.address;
+            cpu.cp15.thread_id_ro = TLS;
+            // what the lib's code leaves below sp gets compared too, from nothing
+            let stack = STACK_TOP - 0x1000 - 32;
+            for at in (stack..stack + 32).step_by(4) {
+                expected.memory.write32(at, 0);
+            }
+            expected.cpu = cpu.clone();
+            let stopped = interpreted(&mut expected);
+            let mut spent = [0i32; 2];
+            for (side, natives_on) in [false, true].into_iter().enumerate() {
+                // safe bc nothing runs the lib's code meanwhile
+                unsafe { (*library).set_natives(natives_on) };
+                for at in (stack..stack + 32).step_by(4) {
+                    got.memory.write32(at, 0);
+                }
+                got.cpu = cpu.clone();
+                let mut ctx = context(&mut got);
+                store(&cpu, &mut ctx);
+                // safe bc got and ctx live thru the run and nothing else touches them
+                let stop = unsafe { recompiled(&mut got, &mut ctx, LIMIT) };
+                spent[side] = LIMIT - ctx.budget;
+                report.tested += 1;
+                let mut found = Vec::new();
+                if stop != stopped {
+                    found.push(format!("stopped with {stopped:?} against {stop:?}"));
+                }
+                for register in (0..results).chain(4..12).chain([13, 15]) {
+                    if expected.cpu.regs[register] != ctx.r[register] {
+                        found.push(format!("r{register} {:08X} against {:08X}", expected.cpu.regs[register], ctx.r[register]));
+                    }
+                }
+                for at in (stack..stack + 32).step_by(4) {
+                    let (want, have) = (expected.memory.read32(at), got.memory.read32(at));
+                    if want != have {
+                        found.push(format!("[{at:08X}] {want:08X} against {have:08X}"));
+                    }
+                }
+                if !found.is_empty() {
+                    report.mismatched += 1;
+                    if report.mismatched <= 20 {
+                        let side = if natives_on { "native" } else { "recompiled" };
+                        println!("  {:?} at {:08X}, {n:X} / {d:X}, {side}: {}", native.kind, native.address, found.join(", "));
+                    }
+                }
+            }
+            if d == 0 {
+                continue;
+            }
+            let negative = signed && ((n >> (bits - 1)) & 1 == 1 || (d >> (bits - 1)) & 1 == 1);
+            let magnitude = |value: u64| if negative && (value >> (bits - 1)) & 1 == 1 { value.wrapping_neg() & (u64::MAX >> (64 - bits)) } else { value };
+            let (un, ud) = if signed { (magnitude(n), magnitude(d)) } else { (n, d) };
+            // 64 bit divisions go by how much longer n is than d, 32 bit ones by quotient bits
+            let quotient_bits = if bits == 64 {
+                (64 + ud.leading_zeros()).saturating_sub(un.leading_zeros())
+            } else if un / ud == 0 {
+                0
+            } else {
+                64 - (un / ud).leading_zeros()
+            };
+            let key = (quotient_bits, negative, un >> 32 != 0, ud >> 32 != 0);
+            let entry = charges.entry(key).or_insert((u64::MAX, 0, 0, 0));
+            let original = spent[0] as u64;
+            *entry = (entry.0.min(original), entry.1.max(original), entry.2 + original, entry.3 + 1);
+            report.charged += 1;
+            report.charged_alike += (spent[1] == spent[0]) as usize;
+            report.most_off = report.most_off.max((spent[1] - spent[0]).abs());
+        }
+        println!("  {:?} at {:08X}, what the title's code charges by quotient bits, sign, high n, high d:", native.kind, native.address);
+        for ((quotient_bits, negative, high_n, high_d), (min, max, sum, count)) in &charges {
+            println!(
+                "    {quotient_bits:2} {} {} {}  {min:4} to {max:4}, mean {:.1}",
+                *negative as u8,
+                *high_n as u8,
+                *high_d as u8,
+                *sum as f64 / *count as f64
+            );
+        }
+    }
+    // safe, same as above
+    unsafe { (*library).set_natives(true) };
     report
 }
